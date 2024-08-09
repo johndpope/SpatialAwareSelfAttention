@@ -1,56 +1,104 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional, Tuple
+
+class WindowAttention(nn.Module):
+    def __init__(self, dim: int, window_size: Tuple[int, int], num_heads: int):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads)
+        )
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))
+        coords_flatten = torch.flatten(coords, 1)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        relative_coords[:, :, 0] += self.window_size[0] - 1
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))
+
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1
+        )
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+
+        attn = attn.softmax(dim=-1)
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        return x
 
 class SpatialAwareSelfAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, window_size=4):
+    def __init__(self, dim: int, num_heads: int, window_size: int):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
-        self.window_size = window_size
+        self.window_size = (window_size, window_size)
         
-        self.qkv_h = nn.Linear(dim, dim * 3, bias=False)
-        self.qkv_l = nn.Linear(dim, dim * 3, bias=False)
-        self.proj = nn.Linear(dim, dim)
+        self.window_attn = WindowAttention(dim, self.window_size, num_heads)
+        self.global_attn = WindowAttention(dim, (1, 1), num_heads)
         
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         B, H, W, C = x.shape
         
         # Window partitioning
-        x_windows = x.view(B, H // self.window_size, self.window_size, W // self.window_size, self.window_size, C)
-        x_windows = x_windows.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, self.window_size * self.window_size, C)
+        x_windows = self.window_partition(x)
         
-        # High frequency path
-        qkv_h = self.qkv_h(x_windows).reshape(-1, self.window_size * self.window_size, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q_h, k_h, v_h = qkv_h[0], qkv_h[1], qkv_h[2]
+        # Window attention
+        x_windows = self.window_attn(x_windows)
         
-        # Low frequency path
-        x_avg = F.avg_pool2d(x.permute(0, 3, 1, 2), self.window_size).permute(0, 2, 3, 1)
-        x_avg = x_avg.view(-1, 1, C)
-        qkv_l = self.qkv_l(x_avg).reshape(-1, 1, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q_l, k_l, v_l = qkv_l[0], qkv_l[1], qkv_l[2]
+        # Merge windows
+        x = self.window_reverse(x_windows, H, W)
         
-        # Attention
-        attn_h = (q_h @ k_h.transpose(-2, -1)) * (self.dim ** -0.5)
-        attn_h = attn_h.softmax(dim=-1)
-        x_h = (attn_h @ v_h).transpose(1, 2).reshape(-1, self.window_size * self.window_size, C)
+        # Global attention
+        x_global = F.adaptive_avg_pool2d(x.permute(0, 3, 1, 2), (1, 1)).permute(0, 2, 3, 1)
+        x_global = self.global_attn(x_global.view(B, 1, C)).view(B, 1, 1, C)
         
-        attn_l = (q_l @ k_l.transpose(-2, -1)) * (self.dim ** -0.5)
-        attn_l = attn_l.softmax(dim=-1)
-        x_l = (attn_l @ v_l).transpose(1, 2).reshape(-1, 1, C)
+        # Combine local and global attention
+        x = x + x_global.expand_as(x)
         
-        # Concatenate and project
-        x_out = torch.cat([x_h, x_l.expand(-1, self.window_size * self.window_size, -1)], dim=-1)
-        x_out = self.proj(x_out)
-        
-        # Reshape back
-        x_out = x_out.view(B, H // self.window_size, W // self.window_size, self.window_size, self.window_size, C)
-        x_out = x_out.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, C)
-        
-        return x_out
+        return x
+    
+    def window_partition(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, W, C = x.shape
+        x = x.view(B, H // self.window_size[0], self.window_size[0], W // self.window_size[1], self.window_size[1], C)
+        windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, self.window_size[0] * self.window_size[1], C)
+        return windows
+
+    def window_reverse(self, windows: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        B = int(windows.shape[0] / (H * W / self.window_size[0] / self.window_size[1]))
+        x = windows.view(B, H // self.window_size[0], W // self.window_size[1], self.window_size[0], self.window_size[1], -1)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+        return x
 
 class ChannelAwareSelfAttention(nn.Module):
-    def __init__(self, dim, reduction=16):
+    def __init__(self, dim: int, reduction: int = 16):
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(dim, dim // reduction, bias=False),
@@ -59,14 +107,14 @@ class ChannelAwareSelfAttention(nn.Module):
             nn.Sigmoid()
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, C = x.shape
         y = torch.mean(x, dim=(1, 2))  # Global average pooling
         y = self.fc(y).view(B, 1, 1, C)
         return x * y.expand_as(x)
 
 class MLGFFN(nn.Module):
-    def __init__(self, dim, expansion_factor=4):
+    def __init__(self, dim: int, expansion_factor: int = 4):
         super().__init__()
         hidden_dim = dim * expansion_factor
         self.fc1 = nn.Linear(dim, hidden_dim)
@@ -75,7 +123,7 @@ class MLGFFN(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, dim)
         self.act = nn.GELU()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, C = x.shape
         x = self.fc1(x)
         x = x.permute(0, 3, 1, 2)  # B, C, H, W
@@ -93,7 +141,7 @@ class MLGFFN(nn.Module):
         return x
 
 class HSCATB(nn.Module):
-    def __init__(self, dim, num_heads=8, window_size=4, mlp_ratio=4):
+    def __init__(self, dim: int, num_heads: int = 8, window_size: int = 4, mlp_ratio: int = 4):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = SpatialAwareSelfAttention(dim, num_heads, window_size)
@@ -102,17 +150,36 @@ class HSCATB(nn.Module):
         self.norm3 = nn.LayerNorm(dim)
         self.mlgffn = MLGFFN(dim, mlp_ratio)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.norm1(x))
         x = x + self.casa(self.norm2(x))
         x = x + self.mlgffn(self.norm3(x))
         return x
 
+class ImageCompressor(nn.Module):
+    def __init__(self, in_channels: int = 3, dim: int = 256, num_blocks: int = 4):
+        super().__init__()
+        self.embed = nn.Conv2d(in_channels, dim, kernel_size=3, stride=1, padding=1)
+        self.blocks = nn.ModuleList([HSCATB(dim) for _ in range(num_blocks)])
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Conv2d(dim, in_channels, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.embed(x).permute(0, 2, 3, 1)  # B, H, W, C
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm(x)
+        x = x.permute(0, 3, 1, 2)  # B, C, H, W
+        x = self.head(x)
+        return x
+
 # Example usage
 if __name__ == "__main__":
-    B, H, W, C = 1, 64, 64, 256
-    x = torch.randn(B, H, W, C)
-    model = HSCATB(dim=C)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    B, H, W, C = 1, 256, 256, 3
+    x = torch.randn(B, C, H, W).to(device)
+    model = ImageCompressor().to(device)
     output = model(x)
     print(f"Input shape: {x.shape}")
     print(f"Output shape: {output.shape}")
+    print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
